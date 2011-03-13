@@ -545,10 +545,15 @@ inspection."
            (string
             (and (cdr expression) (not (cddr expression))
                  (typep (second expression) 'array-length)))
-           (t
+           ((~ * + ? & !)
             (and (symbolp (car expression))
                  (cdr expression) (not (cddr expression))
-                 (validate-expression (second expression))))))
+                 (validate-expression (second expression))))
+           (t
+            (and (symbolp (car expression))
+                 (or (and (cdr expression) (not (cddr expression))
+                          (validate-expression (second expression)))
+                     (not (cdr expression)))))))
         (t
          nil))
       (invalid-expression-error expression)))
@@ -574,10 +579,12 @@ inspection."
        ((and or)
         (dolist (subexpr (cdr expression) seen)
           (setf seen (%expression-dependencies subexpr seen))))
-       ((* + ? & !)
+       ((* + ? & ! ~)
         (%expression-dependencies (second expression) seen))
        (t
-        (%expression-dependencies (second expression) seen))))))
+        (if (cdr expression)
+            (%expression-dependencies (second expression) seen)
+            seen))))))
 
 (defun %expression-direct-dependencies (expression seen)
   (etypecase expression
@@ -594,10 +601,12 @@ inspection."
        ((and or)
         (dolist (subexpr (cdr expression) seen)
           (setf seen (%expression-direct-dependencies subexpr seen))))
-       ((* + ? & !)
+       ((* + ? & ! ~)
         (%expression-direct-dependencies (second expression) seen))
        (t
-        (%expression-direct-dependencies (second expression) seen))))))
+        (if (cdr expression)
+            (%expression-direct-dependencies (second expression) seen)
+            seen))))))
 
 (defun eval-expression (expression text position end)
   (typecase expression
@@ -1002,40 +1011,63 @@ inspection."
 ;;; Semantic predicates
 
 (defun eval-semantic-predicate (expression text position end)
-  (with-expression (expression (t subexpr))
-    (let ((result (eval-expression subexpr text position end)))
-      (if (error-result-p result)
-          (make-error-result
-           :position position
-           :expression expression
-           :detail result)
-          (let ((production (result-production result)))
-            (if (funcall (symbol-function (car expression)) production)
-                result
-                (make-error-result
-                 :position position
-                 :expression expression)))))))
-
-(defun compile-semantic-predicate (expression)
-  (with-expression (expression (t subexpr))
-    (let* ((function (compile-expression subexpr))
-           (predicate (car expression))
-           ;; KLUDGE: Calling via a variable symbol can be slow, and if we
-           ;; grab the SYMBOL-FUNCTION here we will not see redefinitions.
-           (semantic-function
-            (if (eq (symbol-package predicate) (load-time-value (find-package :cl)))
-                (symbol-function predicate)
-                (compile nil `(lambda (x) (,predicate x))))))
-      (named-lambda compiled-semantic-predicate (text position end)
-        (let ((result (funcall function text position end)))
+  (with-expression (expression (t &optional subexpr))
+    (if subexpr
+        (let ((result (eval-expression subexpr text position end)))
           (if (error-result-p result)
               (make-error-result
                :position position
                :expression expression
                :detail result)
               (let ((production (result-production result)))
-                (if (funcall semantic-function production)
+                (if (funcall (symbol-function (car expression)) production)
                     result
                     (make-error-result
                      :position position
-                     :expression expression)))))))))
+                     :expression expression)))))
+        (let ((result (funcall (symbol-function (car expression)))))
+          (if result
+              (make-result
+               :production result
+               :position position)
+              (make-error-result
+               :expression expression
+               :position position))))))
+
+(defun compile-semantic-predicate (expression)
+  (with-expression (expression (t &optional subexpr))
+    (if subexpr
+        (let* ((function (compile-expression subexpr))
+               (predicate (car expression))
+               ;; KLUDGE: Calling via a variable symbol can be slow, and if we
+               ;; grab the SYMBOL-FUNCTION here we will not see redefinitions.
+               (semantic-function
+                (if (eq (symbol-package predicate) (load-time-value (find-package :cl)))
+                    (symbol-function predicate)
+                    (compile nil `(lambda (x) (,predicate x))))))
+          (named-lambda compiled-semantic-predicate (text position end)
+            (let ((result (funcall function text position end)))
+              (if (error-result-p result)
+                  (make-error-result
+                   :position position
+                   :expression expression
+                   :detail result)
+                  (let ((production (result-production result)))
+                    (if (funcall semantic-function production)
+                        result
+                        (make-error-result
+                         :position position
+                         :expression expression)))))))
+        ;; are there any nullary predicates in CL: worth optimizing
+        ;; like the normal case?
+        (let ((predicate (car expression)))
+          (named-lambda compiled-nullary-semantic-predicate (text position end)
+            (declare (ignore text position end))
+            (let ((result (funcall predicate)))
+              (if result
+                  (make-result
+                   :production result
+                   :position position)
+                  (make-error-result
+                   :expression expression
+                   :position position))))))))
